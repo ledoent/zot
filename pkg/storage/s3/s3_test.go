@@ -5343,3 +5343,78 @@ func TestDeleteBlobDeferredIssue2625CrossRepoOriginal(t *testing.T) {
 		So(deletedOriginal.Load(), ShouldBeFalse)
 	})
 }
+
+// TestDeleteBlobUploadCompletedMultipart covers an upload session that can no
+// longer be reopened for append.
+//
+// On S3 this happens when the session's multipart upload has already completed:
+// ListMultipartUploads returns nothing, Stat reports a NON-zero size, and the
+// driver answers "append to zero-size path <path> unsupported" -- a misleading
+// message, since that branch is reached only when the size is not zero
+// (distribution registry/storage/driver/s3-aws/s3.go).
+//
+// Cancel() is unreachable in that state. Before the fallback below, GC retried
+// the same failing path on every pass and never reclaimed the object. Observed
+// in production on a Hetzner-Object-Storage-backed zot: 22 such sessions
+// totalling 6.41 GB, the oldest five months old.
+func TestDeleteBlobUploadCompletedMultipart(t *testing.T) {
+	Convey("Upload exists but cannot be reopened for append", t, func() {
+		tdir := t.TempDir()
+
+		// The exact shape distribution returns for this case.
+		errAppend := driver.Error{
+			DriverName: "s3aws",
+			Detail:     errors.New("append to zero-size path /repo/.uploads/uuid unsupported"),
+		}
+
+		Convey("falls back to a direct delete", func() {
+			deleted := ""
+			imgStore := createMockStorage(t.TempDir(), tdir, false, &mocks.StorageDriverMock{
+				WriterFn: func(ctx context.Context, path string, isAppend bool) (driver.FileWriter, error) {
+					return nil, errAppend
+				},
+				DeleteFn: func(ctx context.Context, path string) error {
+					deleted = path
+
+					return nil
+				},
+			})
+
+			err := imgStore.DeleteBlobUpload(testImage, "uuid")
+			So(err, ShouldBeNil)
+			So(deleted, ShouldContainSubstring, "uuid")
+		})
+
+		Convey("reports both errors when the delete also fails", func() {
+			imgStore := createMockStorage(t.TempDir(), tdir, false, &mocks.StorageDriverMock{
+				WriterFn: func(ctx context.Context, path string, isAppend bool) (driver.FileWriter, error) {
+					return nil, errAppend
+				},
+				DeleteFn: func(ctx context.Context, path string) error {
+					return errS3
+				},
+			})
+
+			err := imgStore.DeleteBlobUpload(testImage, "uuid")
+			So(err, ShouldNotBeNil)
+			// The writer failure must stay visible; the delete error alone
+			// would hide why the normal cancel path was skipped.
+			So(err.Error(), ShouldContainSubstring, "append to zero-size path")
+			So(err.Error(), ShouldContainSubstring, errorText)
+		})
+
+		Convey("reports ErrUploadNotFound when the object is already gone", func() {
+			imgStore := createMockStorage(t.TempDir(), tdir, false, &mocks.StorageDriverMock{
+				WriterFn: func(ctx context.Context, path string, isAppend bool) (driver.FileWriter, error) {
+					return nil, errAppend
+				},
+				DeleteFn: func(ctx context.Context, path string) error {
+					return driver.PathNotFoundError{}
+				},
+			})
+
+			err := imgStore.DeleteBlobUpload(testImage, "uuid")
+			So(err, ShouldEqual, zerr.ErrUploadNotFound)
+		})
+	})
+}
