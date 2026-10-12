@@ -1718,7 +1718,35 @@ func (is *ImageStore) DeleteBlobUpload(repo, uuid string) error {
 			return zerr.ErrUploadNotFound
 		}
 
-		return err
+		// The session exists but cannot be reopened for append, so there is no
+		// multipart upload left to cancel. On S3 this is a session whose
+		// multipart upload already completed: ListMultipartUploads returns
+		// nothing, Stat reports a non-zero size, and the driver answers
+		// "append to zero-size path <path> unsupported" -- a misleading message,
+		// since that branch is reached only when the size is NOT zero
+		// (distribution registry/storage/driver/s3-aws/s3.go).
+		//
+		// Cancel() is unreachable in that state, so the object stays forever:
+		// GC calls this on every pass, fails identically, and never reclaims
+		// the bytes. Delete the object directly instead.
+		//
+		// Safe for both callers: GC only reaches here for sessions already
+		// older than its delay, and the API path is an explicit cancel. Both
+		// mean "make this session go away".
+		is.log.Debug().Err(err).Str("blobUploadPath", blobUploadPath).
+			Msg("blob upload not reopenable for append; deleting the object directly")
+
+		if derr := is.storeDriver.Delete(blobUploadPath); derr != nil {
+			if errclass.IsStorageObjectMissing(derr) {
+				return zerr.ErrUploadNotFound
+			}
+
+			// Report both: the delete failure alone would hide why the normal
+			// cancel path was skipped.
+			return errors.Join(err, derr)
+		}
+
+		return nil
 	}
 
 	defer writer.Close()
